@@ -1,0 +1,6 @@
+{
+  "areas": {"T": "Trabajo", "C": "Casa", "E": "Estudios"},
+  "persona": "Alex",
+  "archivo_pendientes": "pendientes.csv",
+  "archivo_aprendizajes": "aprendizajes.csv"
+}
