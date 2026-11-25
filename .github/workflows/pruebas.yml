@@ -1,0 +1,57 @@
+name: pruebas
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Autopruebas
+        run: |
+          python -I pendientes.py --self-test
+          python -I aprendizajes.py --self-test
+      - name: 20 órdenes que escriben y 20 que leen a la vez
+        run: |
+          d="$RUNNER_TEMP/carrera"
+          mkdir -p "$d"
+          for i in $(seq 1 20); do
+            python -I pendientes.py --raiz "$d" nuevo --de General --para Persona --que "tarea $i" > /dev/null &
+            python -I aprendizajes.py --raiz "$d" nuevo --area General --patron prueba --patron-nuevo \
+              --que "fallo $i" --causa "causa $i" > /dev/null &
+            python -I pendientes.py --raiz "$d" ver todas > /dev/null 2>&1 &
+            python -I aprendizajes.py --raiz "$d" ver > /dev/null 2>&1 &
+          done
+          wait
+          python -I pendientes.py --raiz "$d" comprobar
+          python -I aprendizajes.py --raiz "$d" comprobar
+          python -I - "$d" <<'EOF'
+          import csv, sys
+          from pathlib import Path
+          d = Path(sys.argv[1])
+          for nombre in ("pendientes.csv", "aprendizajes.csv"):
+              with open(d / nombre, encoding="utf-8-sig", newline="") as f:
+                  filas = list(csv.DictReader(f))
+              ids = {f["id"] for f in filas}
+              print(f"{nombre}: {len(filas)} filas, {len(ids)} códigos distintos")
+              assert len(filas) == 20 and len(ids) == 20, nombre
+          sobran = [p.name for p in d.iterdir() if p.suffix == ".tmp"]
+          assert not sobran, sobran
+          EOF
