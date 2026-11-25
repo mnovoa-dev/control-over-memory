@@ -98,8 +98,8 @@ py aprendizajes.py ver --desde 2026-11-01
   niega. Las que solo leen (`ver`, `comprobar`…) no esperan.
   Para eso dejan un archivo `.lock` junto al CSV: si guardas tus CSV en Git, añade `*.lock` y `.*.tmp` a tu
   `.gitignore`.
-- Probadas en Windows y en Linux (también el candado, con 20 órdenes a la vez). En macOS el candado usa la misma
-  función que en Linux, pero no se ha probado allí.
+- Probadas en Windows, Linux y macOS con Python 3.10 y 3.13, en cada cambio (GitHub Actions): las autopruebas y
+  20 órdenes que escriben y 20 que leen a la vez.
 - `resolver` de `pendientes.py` usa Git para encontrar la versión de antes de juntar dos ramas.
 - Un CSV con comas se abre bien en Excel con la configuración en inglés; con la española, mejor con
   «Datos > Desde texto/CSV».
