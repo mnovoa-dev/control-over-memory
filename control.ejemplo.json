@@ -1,0 +1,12 @@
+{
+  "areas": {"T": "Trabajo", "C": "Casa", "E": "Estudios"},
+  "persona": "Alex",
+  "archivo_pendientes": "pendientes.csv",
+  "archivo_aprendizajes": "aprendizajes.csv",
+  "normas": ["CLAUDE.md", "AGENTS.md", "*/CLAUDE.md", "*/AGENTS.md"],
+  "cargados": [],
+  "no_cargados": [],
+  "max_lineas": 200,
+  "herramientas": ["*.py"],
+  "omitir": []
+}

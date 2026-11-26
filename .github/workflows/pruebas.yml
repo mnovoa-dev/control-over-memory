@@ -28,6 +28,7 @@ jobs:
         run: |
           python -I pendientes.py --self-test
           python -I aprendizajes.py --self-test
+          python -I revision.py --self-test
       - name: 20 órdenes que escriben y 20 que leen a la vez
         run: |
           d="$RUNNER_TEMP/carrera"

@@ -25,7 +25,7 @@ Estados: `pendiente` (falta una regla), `incorporada` (la regla está en `donde`
 suelto: `regla` dice por qué no hace falta) y `descartada`. Una fila incorporada exige `donde` con una
 ruta que exista; lo que vaya tras « → » o «#» en `donde` es el apartado.
 
-Las áreas salen de `config.json` en la raíz (ver `config.ejemplo.json`); sin él, hay una sola: General.
+Las áreas salen de `control.json` en la raíz (ver `control.ejemplo.json`); sin él, hay una sola: General.
 Una orden cada vez: si otra está escribiendo, la segunda espera unos segundos (archivo `.lock`).
 """
 
@@ -52,33 +52,48 @@ AVANCE = {"pendiente": 0, "descartada": 1, "sin regla": 2, "incorporada": 3}
 RE_PATRON = re.compile(r"^[a-z0-9ñ]+(-[a-z0-9ñ]+)*\Z")
 
 
+def aviso_config_vieja(raiz):
+    """Las primeras versiones leían `config.json`. Si está ese y no `control.json`, y es de estas herramientas
+    (tiene alguna de sus claves), se para: seguir sin él cambiaría las áreas o los archivos sin avisar."""
+    vieja = Path(raiz) / "config.json"
+    if (Path(raiz) / "control.json").exists() or not vieja.is_file():
+        return
+    try:
+        datos = json.loads(vieja.read_text(encoding="utf-8-sig"))
+    except (ValueError, UnicodeDecodeError, OSError):
+        return
+    if isinstance(datos, dict) and {"areas", "persona", "archivo_pendientes", "archivo_aprendizajes"} & set(datos):
+        raise SystemExit("✗ Hay un config.json de una versión anterior: renómbralo a control.json (el contenido vale tal cual).")
+
+
 class Config:
     """Lo que cambia de un usuario a otro: las áreas (letra → nombre) y el nombre del archivo."""
 
     def __init__(self, raiz: Path):
         datos = {}
-        ruta = raiz / "config.json"
+        aviso_config_vieja(raiz)
+        ruta = raiz / "control.json"
         if ruta.is_file():
             try:
                 datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
             except (ValueError, UnicodeDecodeError) as e:
-                raise SystemExit(f"✗ config.json no es un JSON válido: {e}")
+                raise SystemExit(f"✗ control.json no es un JSON válido: {e}")
             if not isinstance(datos, dict):
-                raise SystemExit("✗ config.json debe ser un objeto: {\"areas\": {...}}")
+                raise SystemExit("✗ control.json debe ser un objeto: {\"areas\": {...}}")
         self.areas: dict[str, str] = datos.get("areas") or {"G": "General"}
         if not isinstance(self.areas, dict):
-            raise SystemExit("✗ config.json: «areas» debe ser un objeto letra → nombre")
+            raise SystemExit("✗ control.json: «areas» debe ser un objeto letra → nombre")
         for letra, nombre in self.areas.items():
             if not re.fullmatch(r"[A-Z]", letra):
-                raise SystemExit(f"✗ config.json: la letra de área «{letra}» debe ser una sola mayúscula")
+                raise SystemExit(f"✗ control.json: la letra de área «{letra}» debe ser una sola mayúscula")
             if not isinstance(nombre, str) or not nombre.strip():
-                raise SystemExit(f"✗ config.json: el área {letra} necesita un nombre")
+                raise SystemExit(f"✗ control.json: el área {letra} necesita un nombre")
         if len({n.lower() for n in self.areas.values()}) != len(self.areas):
-            raise SystemExit("✗ config.json: dos áreas con el mismo nombre")
+            raise SystemExit("✗ control.json: dos áreas con el mismo nombre")
         self.archivo = datos.get("archivo_aprendizajes") or "aprendizajes.csv"
         if not isinstance(self.archivo, str) or Path(self.archivo).name != self.archivo \
                 or not self.archivo.endswith(".csv"):
-            raise SystemExit("✗ config.json: «archivo_aprendizajes» debe ser un nombre .csv, sin carpetas")
+            raise SystemExit("✗ control.json: «archivo_aprendizajes» debe ser un nombre .csv, sin carpetas")
         self.letra = {v.lower(): k for k, v in self.areas.items()}
         self.orden = "".join(self.areas)
         self.re_id = re.compile(rf"^A([{self.orden}])([1-9][0-9]*)\Z")
@@ -351,6 +366,12 @@ def devolver(rutas, numero, corregida, descartar, columnas, es_id, usados, anadi
 def mete_salto(antes, despues):
     """True si un campo cambiado trae un salto de línea (aunque ese campo ya tuviera otro)."""
     return any(v != antes.get(c) and re.search(r"[\r\n]", v or "") for c, v in despues.items())
+
+
+def pisa_salto(antes, despues):
+    """El campo que se cambia y ya tenía un salto de línea (o None). Ese salto puede ser una comilla sin cerrar que
+    se tragó líneas que no parecen filas: cambiar el campo las borraría sin avisar."""
+    return next((c for c, v in despues.items() if v != antes.get(c) and re.search(r"[\r\n]", antes.get(c) or "")), None)
 
 
 def ruta_de(donde: str) -> str:
@@ -730,6 +751,11 @@ def o_cambiar(t: Tabla, a: argparse.Namespace) -> int:
             fila[campo] = valor.strip().lower() if campo == "patron" else valor
     # «cambiar» tiene que poder arreglar una tabla con errores (por ejemplo, si se borró el archivo de una
     # regla): se escribe si no añade ningún error nuevo.
+    campo = pisa_salto(copia, fila)
+    if campo:
+        print(f"✗ No se escribe: «{campo}» tiene varias líneas (¿una comilla sin cerrar se tragó otras?) y cambiarlo "
+              "las borraría. Ejecuta «reparar»: guarda una copia y aparta lo que no entiende.")
+        return 1
     if mete_salto(copia, fila):
         print("✗ No se escribe: un campo no admite saltos de línea.")
         return 1
@@ -760,6 +786,8 @@ def principal() -> int:
         print(f"✗ Un archivo no está en UTF-8 (¿guardado desde otro programa?): {e}")
     except OSError as e:
         print(f"✗ {e.strerror or e}: {e.filename or ''}")
+    except csv.Error as e:
+        print(f"✗ La tabla no se puede leer como CSV ({e}): prueba «reparar», que guarda una copia antes.")
     return 1
 
 
@@ -774,7 +802,7 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory() as d:
         raiz = Path(d)
-        (raiz / "config.json").write_text(json.dumps(
+        (raiz / "control.json").write_text(json.dumps(
             {"areas": {"T": "Trabajo", "C": "Casa", "E": "Estudios"}}), encoding="utf-8")
         (raiz / "regla.md").write_text("x", encoding="utf-8")
         cfg = Config(raiz)
@@ -864,7 +892,7 @@ def self_test() -> int:
         crudo = ruta.read_bytes()
         prueba(crudo.startswith(b"\xef\xbb\xbf") and b"\r\n" not in crudo, "UTF-8 con BOM y LF")
         rc, _ = run("nuevo", "--area", "Jardín", "--patron", "fecha-equivocada", "--que", "x", "--causa", "y")
-        prueba(rc != 0, "área que no está en config.json rechazada")
+        prueba(rc != 0, "área que no está en control.json rechazada")
         # Una comilla sin cerrar se traga las filas siguientes; una columna de más se perdería al escribir
         sano = ruta.read_text(encoding="utf-8-sig")
         ruta.write_text(sano.replace(",a,b,", ',"a,b,', 1), encoding="utf-8-sig")
@@ -919,6 +947,12 @@ def self_test() -> int:
         antes = ruta.read_bytes()
         prueba(run("cambiar", "AC1", "--fuente", "a" + chr(10) + "b")[0] != 0 and ruta.read_bytes() == antes,
                "un campo que ya tenía salto no admite otro")
+        # Una comilla sin cerrar en la última columna se traga líneas que no parecen filas: tampoco se borran
+        ruta.write_text(sano.rstrip(chr(10)) + '"' + chr(10) + "algo escrito a mano" + chr(10), encoding="utf-8-sig")
+        antes = ruta.read_bytes()
+        rc, out = run("cambiar", "AC2", "--fuente", "ok")
+        prueba(rc != 0 and "reparar" in out and ruta.read_bytes() == antes,
+               "cambiar no borra líneas tragadas que no son filas")
     with tempfile.TemporaryDirectory() as d:
         vacio = Path(d) / "aprendizajes.csv"
         vacio.write_text("", encoding="utf-8")
@@ -936,16 +970,24 @@ def self_test() -> int:
             rc = main(["--raiz", d, "nuevo", "--area", "General", "--patron", "x", "--que", "a", "--causa", "b"])
             rc_raiz = main(["--raiz", str(Path(d) / "no-existe"), "comprobar"])
         prueba(rc == 0 and leer(Path(d) / "aprendizajes.csv")[1][0]["id"] == "AG1",
-               "sin config.json funciona con el área General")
+               "sin control.json funciona con el área General")
         prueba(rc_raiz == 1, "--raiz inexistente: error, no un OK vacío")
         for config in ("{roto", '{"archivo_aprendizajes": "../fuera.csv"}', '{"areas": {"T": "A", "C": "a"}}'):
-            (Path(d) / "config.json").write_text(config, encoding="utf-8")
+            (Path(d) / "control.json").write_text(config, encoding="utf-8")
             try:
                 Config(Path(d))
                 rechazada = False
             except SystemExit:
                 rechazada = True
-            prueba(rechazada, f"config.json no válido se rechaza: {config}")
+            prueba(rechazada, f"control.json no válido se rechaza: {config}")
+        (Path(d) / "control.json").unlink()
+        (Path(d) / "config.json").write_text('{"areas": {"T": "Trabajo"}}', encoding="utf-8")
+        try:
+            Config(Path(d))
+            pide = False
+        except SystemExit as e:
+            pide = "renómbralo" in str(e)
+        prueba(pide, "un config.json de antes pide renombrarlo")
     with tempfile.TemporaryDirectory() as d:
         raiz = Path(d)
         ruta = raiz / "aprendizajes.csv"

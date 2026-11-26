@@ -26,7 +26,7 @@ Uso (desde la carpeta del proyecto, o con --raiz):
   pendientes.py --self-test
 Opciones comunes: --raiz RUTA, --hoy AAAA-MM-DD.
 
-Las áreas y el nombre de la persona que decide salen de `config.json` (ver `config.ejemplo.json`).
+Las áreas y el nombre de la persona que decide salen de `control.json` (ver `control.ejemplo.json`).
 Una orden cada vez: si otra está escribiendo, la segunda espera unos segundos (archivo `.lock`).
 """
 import argparse
@@ -66,37 +66,52 @@ ESCRIBEN = {"nuevo", "estado", "cambiar", "archivar"}
 SOLO_LEEN = {"ver", "hechos", "detalle", "buscar", "comprobar", "apartadas"}
 
 
+def aviso_config_vieja(raiz):
+    """Las primeras versiones leían `config.json`. Si está ese y no `control.json`, y es de estas herramientas
+    (tiene alguna de sus claves), se para: seguir sin él cambiaría las áreas o los archivos sin avisar."""
+    vieja = Path(raiz) / "config.json"
+    if (Path(raiz) / "control.json").exists() or not vieja.is_file():
+        return
+    try:
+        datos = json.loads(vieja.read_text(encoding="utf-8-sig"))
+    except (ValueError, UnicodeDecodeError, OSError):
+        return
+    if isinstance(datos, dict) and {"areas", "persona", "archivo_pendientes", "archivo_aprendizajes"} & set(datos):
+        raise SystemExit("✗ Hay un config.json de una versión anterior: renómbralo a control.json (el contenido vale tal cual).")
+
+
 class Config:
     """Lo que cambia de un usuario a otro: las áreas (letra → nombre), quién decide y el archivo."""
 
     def __init__(self, raiz):
         datos = {}
-        ruta = Path(raiz) / "config.json"
+        aviso_config_vieja(raiz)
+        ruta = Path(raiz) / "control.json"
         if ruta.is_file():
             try:
                 datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
             except (ValueError, UnicodeDecodeError) as e:
-                raise SystemExit(f"✗ config.json no es un JSON válido: {e}")
+                raise SystemExit(f"✗ control.json no es un JSON válido: {e}")
             if not isinstance(datos, dict):
-                raise SystemExit("✗ config.json debe ser un objeto: {\"areas\": {...}, \"persona\": \"...\"}")
+                raise SystemExit("✗ control.json debe ser un objeto: {\"areas\": {...}, \"persona\": \"...\"}")
         self.areas = datos.get("areas") or {"G": "General"}
         if not isinstance(self.areas, dict):
-            raise SystemExit("✗ config.json: «areas» debe ser un objeto letra → nombre")
+            raise SystemExit("✗ control.json: «areas» debe ser un objeto letra → nombre")
         for letra, nombre in self.areas.items():
             if not re.fullmatch(r"[A-Z]", letra):
-                raise SystemExit(f"✗ config.json: la letra de área «{letra}» debe ser una sola mayúscula")
+                raise SystemExit(f"✗ control.json: la letra de área «{letra}» debe ser una sola mayúscula")
             if not isinstance(nombre, str) or not nombre.strip():
-                raise SystemExit(f"✗ config.json: el área {letra} necesita un nombre")
+                raise SystemExit(f"✗ control.json: el área {letra} necesita un nombre")
         self.persona = datos.get("persona") or "Persona"
         if not isinstance(self.persona, str) or not self.persona.strip():
-            raise SystemExit("✗ config.json: «persona» debe ser un nombre")
+            raise SystemExit("✗ control.json: «persona» debe ser un nombre")
         nombres = [n.lower() for n in self.areas.values()] + [self.persona.lower()]
         if len(set(nombres)) != len(nombres):
-            raise SystemExit("✗ config.json: las áreas y la persona necesitan nombres distintos")
+            raise SystemExit("✗ control.json: las áreas y la persona necesitan nombres distintos")
         self.archivo = datos.get("archivo_pendientes") or ARCHIVO
         if not isinstance(self.archivo, str) or Path(self.archivo).name != self.archivo \
                 or not self.archivo.endswith(".csv"):
-            raise SystemExit("✗ config.json: «archivo_pendientes» debe ser un nombre .csv, sin carpetas")
+            raise SystemExit("✗ control.json: «archivo_pendientes» debe ser un nombre .csv, sin carpetas")
         self.archivo_cerrados = Path(self.archivo).stem + "_cerrados.csv"
         self.letra = {v.lower(): k for k, v in self.areas.items()}
         self.orden = "".join(self.areas)
@@ -345,6 +360,12 @@ def devolver(rutas, numero, corregida, descartar, columnas, es_id, usados, anadi
 def mete_salto(antes, despues):
     """True si un campo cambiado trae un salto de línea (aunque ese campo ya tuviera otro)."""
     return any(v != antes.get(c) and re.search(r"[\r\n]", v or "") for c, v in despues.items())
+
+
+def pisa_salto(antes, despues):
+    """El campo que se cambia y ya tenía un salto de línea (o None). Ese salto puede ser una comilla sin cerrar que
+    se tragó líneas que no parecen filas: cambiar el campo las borraría sin avisar."""
+    return next((c for c, v in despues.items() if v != antes.get(c) and re.search(r"[\r\n]", antes.get(c) or "")), None)
 
 
 def orden_id(fila, cfg):
@@ -873,6 +894,11 @@ def o_cambiar(t, a):
         return 1
     copia = dict(previa)
     f = orden_cambiar(t.filas, a, t.cfg)
+    campo = pisa_salto(copia, f)
+    if campo:
+        print(f"✗ No se escribe: «{campo}» tiene varias líneas (¿una comilla sin cerrar se tragó otras?) y cambiarlo "
+              "las borraría. Ejecuta «reparar»: guarda una copia y aparta lo que no entiende.")
+        return 1
     if mete_salto(copia, f):
         print("✗ No se escribe: un campo no admite saltos de línea.")
         return 1
@@ -1085,6 +1111,8 @@ def principal():
         print(f"✗ Un archivo no está en UTF-8 (¿guardado desde otro programa?): {e}")
     except OSError as e:
         print(f"✗ {e.strerror or e}: {e.filename or ''}")
+    except csv.Error as e:
+        print(f"✗ La tabla no se puede leer como CSV ({e}): prueba «reparar», que guarda una copia antes.")
     return 1
 
 
@@ -1117,7 +1145,7 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         raiz = Path(tmp)
-        (raiz / "config.json").write_text(json.dumps(
+        (raiz / "control.json").write_text(json.dumps(
             {"areas": {"T": "Trabajo", "C": "Casa", "E": "Estudios"}, "persona": "Alex"}), encoding="utf-8")
         cfg = Config(raiz)
         (raiz / "ficha.md").write_text("x", encoding="utf-8")
@@ -1346,11 +1374,16 @@ def self_test():
            "con errores, nuevo y estado no escriben")
         ok(run("cambiar", uno, "--que", "a" + chr(10) + "b") == 1 and ruta.read_bytes() == antes,
            "cambiar no añade un error nuevo")
-        rc, out = con_salida("cambiar", uno, "--nota", "bien")
-        ok(rc == 0 and "sigue con errores" in out and filas_de()[0]["nota"] == "bien",
-           "los errores que ya estaban no impiden arreglar otra fila")
-        ok(run("cambiar", dos, "--nota", "bien") == 0 and run("comprobar") == 0,
-           "cambiar arregla la tabla aunque tenga errores")
+        rc, out = con_salida("cambiar", uno, "--que", "bien")
+        ok(rc == 0 and "sigue con errores" in out and filas_de()[0]["que"] == "bien",
+           "los errores que ya estaban no impiden cambiar otro campo")
+        antes = ruta.read_bytes()
+        rc, out = con_salida("cambiar", dos, "--nota", "bien")
+        ok(rc == 1 and "reparar" in out and ruta.read_bytes() == antes,
+           "un campo de varias líneas no se pisa (podría llevar líneas tragadas): se manda a reparar")
+        ok(run("reparar") == 0 and run("cambiar", uno, "--nota", "bien") == 0
+           and run("cambiar", dos, "--nota", "bien") == 0 and run("comprobar") == 0,
+           "tras reparar, cambiar arregla la tabla")
         ruta.write_text(sano.replace(",primera,", ",primera,EXTRA,"), encoding="utf-8-sig")
         antes = ruta.read_bytes()
         ok(run("cambiar", dos, "--que", "z") == 1 and ruta.read_bytes() == antes,
@@ -1369,6 +1402,11 @@ def self_test():
         antes = ruta.read_bytes()
         ok(run("cambiar", uno, "--nota", "a" + chr(10) + "b") == 1 and ruta.read_bytes() == antes,
            "un campo que ya tenía salto no admite otro")
+        # Una comilla sin cerrar en la última columna se traga líneas que no parecen filas: tampoco se borran
+        ruta.write_text(sano.rstrip(chr(10)) + '"' + chr(10) + "algo escrito a mano" + chr(10), encoding="utf-8-sig")
+        antes = ruta.read_bytes()
+        ok(run("cambiar", dos, "--nota", "ok") == 1 and ruta.read_bytes() == antes,
+           "cambiar no borra líneas tragadas que no son filas")
         ruta.write_text(sano, encoding="utf-8-sig")
         # --base que no es un commit (solo si hay Git)
         if shutil.which("git"):
@@ -1407,23 +1445,28 @@ def self_test():
         with contextlib.redirect_stdout(io.StringIO()):
             rc = main(["nuevo", "--de", "General", "--para", "Persona", "--que", "x", "--raiz", tmp])
             ok(main(["comprobar", "--raiz", str(Path(tmp) / "no-existe")]) == 1, "--raiz inexistente: error")
-        ok(rc == 0 and leer(Path(tmp) / ARCHIVO)[1][0]["id"] == "G1", "sin config.json: área General y «Persona»")
+        ok(rc == 0 and leer(Path(tmp) / ARCHIVO)[1][0]["id"] == "G1", "sin control.json: área General y «Persona»")
         for config in ("{roto", '{"archivo_pendientes": "../fuera.csv"}', '{"persona": 7}',
                        '{"areas": {"T": "Trabajo", "C": "trabajo"}}'):
-            (Path(tmp) / "config.json").write_text(config, encoding="utf-8")
-            ok(falla(Config, Path(tmp)) is not None, f"config.json no válido se rechaza: {config}")
+            (Path(tmp) / "control.json").write_text(config, encoding="utf-8")
+            ok(falla(Config, Path(tmp)) is not None, f"control.json no válido se rechaza: {config}")
+        (Path(tmp) / "control.json").unlink()
+        (Path(tmp) / "config.json").write_text('{"areas": {"T": "Trabajo"}}', encoding="utf-8")
+        ok("renómbralo" in (falla(Config, Path(tmp)) or ""), "un config.json de antes pide renombrarlo")
+        (Path(tmp) / "config.json").write_text('{"otro_programa": 1}', encoding="utf-8")
+        ok(falla(Config, Path(tmp)) is None, "un config.json de otro programa no molesta")
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "config.json").write_text('{"archivo_pendientes": "tareas.csv"}', encoding="utf-8")
+        (Path(tmp) / "control.json").write_text('{"archivo_pendientes": "tareas.csv"}', encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             rc = main(["nuevo", "--de", "General", "--para", "General", "--que", "x", "--raiz", tmp,
                        "--hoy", "2026-01-01"])
             main(["estado", "G1", "hecha", "--raiz", tmp, "--hoy", "2026-01-01"])
             main(["archivar", "--raiz", tmp, "--hoy", "2026-03-01"])
         ok(rc == 0 and not (Path(tmp) / ARCHIVO).exists() and len(leer(Path(tmp) / "tareas_cerrados.csv")[1]) == 1,
-           "el nombre del archivo sale de config.json (y el de cerradas, de él)")
+           "el nombre del archivo sale de control.json (y el de cerradas, de él)")
     with tempfile.TemporaryDirectory() as tmp:
         raiz = Path(tmp)
-        (raiz / "config.json").write_text(json.dumps(
+        (raiz / "control.json").write_text(json.dumps(
             {"areas": {"T": "Trabajo", "C": "Casa"}, "persona": "Alex"}), encoding="utf-8")
         cfg = Config(raiz)
         ruta = raiz / cfg.archivo
