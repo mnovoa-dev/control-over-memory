@@ -1,3 +1,4 @@
 *.lock
 .*.tmp
+.*.copia
 __pycache__/

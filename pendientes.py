@@ -20,6 +20,9 @@ Uso (desde la carpeta del proyecto, o con --raiz):
   pendientes.py comprobar              solo comprueba; código 1 si hay errores
   pendientes.py resolver [--base REF]  arregla las filas repetidas tras juntar ramas de Git
   pendientes.py archivar [--dias 30]   pasa las cerradas hace más de N días a pendientes_cerrados.csv
+  pendientes.py reparar                repara un CSV roto (comillas, columnas, primera línea, «;»), con copia
+  pendientes.py apartadas              lo que «reparar» no entendió y apartó
+  pendientes.py devolver <n> [--fila "…" | --descartar]  lo devuelve a la tabla con su mismo código
   pendientes.py --self-test
 Opciones comunes: --raiz RUTA, --hoy AAAA-MM-DD.
 
@@ -60,7 +63,7 @@ PERMISOS = ["preguntar", "aprobada", "libre"]
 RE_FECHA = re.compile(r"^\d{4}-\d{2}-\d{2}\Z")
 DIAS_PRONTO = 14
 ESCRIBEN = {"nuevo", "estado", "cambiar", "archivar"}
-SOLO_LEEN = {"ver", "hechos", "detalle", "buscar", "comprobar"}
+SOLO_LEEN = {"ver", "hechos", "detalle", "buscar", "comprobar", "apartadas"}
 
 
 class Config:
@@ -151,6 +154,197 @@ def leer(ruta):
 def forma_rota(fila):
     """Columnas de más (la clave None de csv) o de menos (valores None): la fila no se puede leer bien."""
     return None in fila or None in fila.values()
+
+
+csv.field_size_limit(10_000_000)  # una comilla sin cerrar puede dejar casi todo el archivo en un campo
+
+
+def leer_linea(texto, n, es_id, sep=","):
+    """Las celdas si el texto, leído tal cual, es una sola fila de n columnas con código válido."""
+    try:
+        registros = list(csv.reader(io.StringIO(texto, newline=""), strict=True, delimiter=sep))
+    except csv.Error:
+        return None
+    if len(registros) != 1 or len(registros[0]) != n or not es_id(registros[0][0].strip()):
+        return None
+    return registros[0]
+
+
+def partir(linea, n, es_id, sep=","):
+    """Como leer_linea, tolerando una comilla que sobra en una línea del archivo."""
+    celdas = leer_linea(linea, n, es_id, sep)
+    if celdas is None and linea.count('"') % 2:
+        if linea.endswith('"') and (celdas := leer_linea(linea[:-1], n, es_id, sep)):
+            return celdas
+        posibles = [c for i, letra in enumerate(linea)
+                    if letra == '"' and (c := leer_linea(linea[:i] + linea[i + 1:], n, es_id, sep))]
+        if len({tuple(c) for c in posibles}) == 1:  # si cabe más de una lectura, no se adivina
+            celdas = posibles[0]
+    return celdas
+
+
+def registros_crudos(texto):
+    """(celdas, líneas del archivo) de cada registro del CSV, cabecera incluida."""
+    lineas = re.split(r"\r\n|\n|\r", texto)
+    lector = csv.reader(io.StringIO(texto, newline=""))
+    desde = 0
+    for celdas in lector:
+        trozo, desde = lineas[desde:lector.line_num], lector.line_num
+        yield celdas, trozo
+
+
+def tragadas(texto, n, es_id):
+    """True si alguna fila completa está metida dentro de un campo de otra: escribir encima la borraría."""
+    return any(partir(linea, n, es_id) for _, trozo in list(registros_crudos(texto))[1:] for linea in trozo[1:])
+
+
+def rehacer(texto, n, es_id, sep=","):
+    """(filas, apartadas), línea a línea (las herramientas escriben una fila por línea): cada línea que es una fila
+    vuelve a serlo; un texto partido en varias líneas se une con espacios; lo que no se entiende se aparta tal
+    cual. Nada se descarta."""
+    lineas = re.split(r"\r\n|\n|\r", texto)[1:]
+    filas, apartadas, i = [], [], 0
+    while i < len(lineas):
+        if not lineas[i].strip():
+            i += 1
+            continue
+        fila, fin = leer_linea(lineas[i], n, es_id, sep), i
+        if fila is None:  # ¿un campo con saltos de línea? Se juntan líneas sin tragarse otra fila
+            for j in range(i + 1, min(i + 60, len(lineas))):
+                if partir(lineas[j], n, es_id, sep):
+                    break
+                fila = leer_linea("\n".join(lineas[i:j + 1]), n, es_id, sep)
+                if fila:
+                    fila, fin = [" ".join(c.split()) if "\n" in c else c for c in fila], j
+                    break
+        if fila is None:
+            fila = partir(lineas[i], n, es_id, sep)
+        if fila:
+            filas.append(fila)
+        else:
+            apartadas.append(lineas[i])
+        i = fin + 1
+    return filas, apartadas
+
+
+def leer_cabecera_rota(lineas, columnas, es_id):
+    """Qué hacer con la primera línea: (separador, líneas de datos) o None si no se puede saber sin adivinar."""
+    for sep in (",", ";"):
+        if next(csv.reader(lineas[:1], delimiter=sep), []) == columnas:
+            return sep, lineas[1:]
+    falta = partir(lineas[0], len(columnas), es_id) is not None  # la primera línea ya es una fila
+    datos = lineas if falta else lineas[1:]
+    if not falta:
+        nombres = [c.strip().strip('"').strip() for c in re.split(r"[,;]", lineas[0])]
+        if len(nombres) >= len(columnas) and any(
+                c in columnas and (i >= len(columnas) or columnas[i] != c) for i, c in enumerate(nombres)):
+            return None  # columnas en otro orden o de más: reponer los nombres cambiaría lo que significa cada dato
+    llenas = [linea for linea in datos if linea.strip()]
+    completas = sum(1 for linea in llenas if partir(linea, len(columnas), es_id))
+    return (",", datos) if completas and completas * 2 >= len(llenas) else None
+
+
+def reparar_archivo(ruta, columnas, es_id, guardar):
+    """Repara un CSV sin depender de Git: antes de tocarlo deja una copia al lado. Devuelve (bien, mensajes)."""
+    texto = ruta.read_text(encoding="utf-8-sig")
+    lineas = re.split(r"\r\n|\n|\r", texto)
+    arreglo = leer_cabecera_rota(lineas, columnas, es_id) if texto.strip() else None
+    if arreglo is None:
+        return False, [f"✗ La primera línea de {ruta.name} no es la cabecera esperada y las filas no permiten "
+                       "reponerla sin adivinar: no se toca."]
+    sep, datos = arreglo
+    cabecera_bien = sep == "," and next(csv.reader(lineas[:1]), []) == columnas
+    filas, apartadas = rehacer("\n".join(["cabecera", *datos]), len(columnas), es_id, sep)
+    antiguas = [celdas for celdas, _ in registros_crudos(texto)]
+    if cabecera_bien and not apartadas and filas == [c for c in antiguas[1:] if c]:
+        return True, [f"{ruta.name}: nada que reparar."]
+    sello = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+    copia = ruta.with_name(f".{ruta.name}.{sello}.copia")
+    copia.write_bytes(ruta.read_bytes())
+    mensajes = [f"{ruta.name}: copia de cómo estaba en {copia.name}"]
+    if sep == ";":
+        mensajes.append("  separado por «;»: vuelve a comas")
+    elif not cabecera_bien:
+        mensajes.append("  se repone la primera línea (los nombres de las columnas)")
+    if apartadas:
+        aparte = ruta_apartadas(ruta)
+        with open(aparte, "a", encoding="utf-8", newline="") as f:
+            f.write(f"# {sello}\n" + "".join(f"? {linea}\n" for linea in apartadas))
+        mensajes.append(f"  ! {len(apartadas)} líneas que no se entienden, apartadas tal cual en {aparte.name}: "
+                        "míralas con «apartadas»")
+    guardar([dict(zip(columnas, f)) for f in filas])
+    mensajes.append(f"  {ruta.name}: {len(filas)} filas")
+    return True, mensajes
+
+
+def ruta_apartadas(ruta):
+    return ruta.with_name(ruta.name + ".apartadas.txt")
+
+
+def lineas_apartadas(ruta):
+    archivo = ruta_apartadas(ruta)
+    return archivo.read_text(encoding="utf-8").split("\n") if archivo.is_file() else []
+
+
+def sin_revisar(*rutas):
+    """(tabla, posición, línea) de cada línea apartada que sigue sin revisar («? » delante)."""
+    return [(r, i, linea[2:]) for r in rutas for i, linea in enumerate(lineas_apartadas(r)) if linea.startswith("? ")]
+
+
+def codigo_de(linea):
+    return re.split(r"[,;]", linea, maxsplit=1)[0].strip().strip('"').strip()
+
+
+def codigos_apartados(*rutas):
+    """Los códigos de todo lo que se apartó alguna vez: quedan reservados, «nuevo» no los reutiliza."""
+    return [{"id": codigo_de(linea.split(" ", 1)[1])} for r in rutas for linea in lineas_apartadas(r)
+            if linea.startswith(("? ", "# devuelta: ", "# descartada: "))]
+
+
+def aviso_apartadas(*rutas):
+    n = len(sin_revisar(*rutas))
+    return [f"Quedan {n} líneas apartadas sin revisar: «apartadas» las enseña y «devolver» las recupera."] if n else []
+
+
+def listar_apartadas(*rutas):
+    return [f"  {n}. {linea}" for n, (_, _, linea) in enumerate(sin_revisar(*rutas), 1)] or ["No hay líneas apartadas."]
+
+
+def devolver(rutas, numero, corregida, descartar, columnas, es_id, usados, anadir):
+    """Devuelve a su tabla una línea apartada, con su mismo código. `anadir(tabla, fila)` escribe y da [] o los
+    errores que lo impiden. Nada se borra del archivo de apartadas: la línea queda marcada."""
+    quedan = sin_revisar(*rutas)
+    if not 1 <= numero <= len(quedan):
+        return 1, [f"✗ No hay línea apartada número {numero} (mira «apartadas»)."]
+    ruta, posicion, original = quedan[numero - 1]
+
+    def marcar(marca):
+        lineas = lineas_apartadas(ruta)
+        lineas[posicion] = f"# {marca}: {original}"
+        ruta_apartadas(ruta).write_text("\n".join(lineas), encoding="utf-8", newline="")
+
+    if descartar:
+        marcar("descartada")
+        return 0, [f"Descartada (queda escrita en {ruta_apartadas(ruta).name})."]
+    celdas = partir(corregida or original, len(columnas), es_id)
+    if celdas is None:
+        return 1, [f"✗ No es una fila completa de {len(columnas)} columnas con un código válido. Pásala corregida con "
+                   f"--fila. Columnas: {','.join(columnas)}"]
+    codigo = celdas[0].strip()
+    if es_id(codigo_de(original)) and codigo != codigo_de(original):
+        return 1, [f"✗ La línea apartada es {codigo_de(original)}: conserva ese código."]
+    if codigo in usados:
+        return 1, [f"✗ {codigo} ya está en la tabla."]
+    errores = anadir(ruta, dict(zip(columnas, celdas)))
+    if errores:
+        return 1, ["✗ No se devuelve: la tabla quedaría con errores:"] + errores
+    marcar("devuelta")
+    return 0, [f"{codigo} devuelta a {ruta.name}."]
+
+
+def mete_salto(antes, despues):
+    """True si un campo cambiado trae un salto de línea (aunque ese campo ya tuviera otro)."""
+    return any(v != antes.get(c) and re.search(r"[\r\n]", v or "") for c, v in despues.items())
 
 
 def orden_id(fila, cfg):
@@ -533,7 +727,7 @@ def orden_detalle(filas, cerrados, raiz, ident):
 
 
 # ---- Juntar ramas de Git ----------------------------------------------------------------
-def resolver_fusion(filas, base, cerrados, cfg):
+def resolver_fusion(filas, base, cerrados, cfg, reservados=()):
     """Deshace lo que deja `merge=union` al juntar dos ramas que tocaron pendientes.csv.
 
     Para cada id repetido compara cada versión con la de antes de juntar (`base`): se queda con lo
@@ -587,7 +781,7 @@ def resolver_fusion(filas, base, cerrados, cfg):
         msgs.append(f"{i}: juntadas {len(versiones)} versiones")
     for v in nuevas:
         letra = (v.get("id") or "")[:1]
-        nuevo = siguiente_id(salida + nuevas, cerrados, letra, cfg) if letra in cfg.areas else v["id"]
+        nuevo = siguiente_id(salida + nuevas, cerrados + list(reservados), letra, cfg) if letra in cfg.areas else v["id"]
         msgs.append(f"{v['id']}: dos pendientes nuevos con el mismo código; «{v.get('que')}» pasa a {nuevo}")
         v["id"] = nuevo
         salida.append(v)
@@ -626,17 +820,23 @@ class Tabla:
         self.cabecera, self.filas = leer(self.ruta)
         _, self.cerrados = leer(self.ruta_cerr)
         self.errores, self.avisos = comprobar(self.filas, raiz, cfg, self.cabecera, self.cerrados)
+        self.avisos += aviso_apartadas(self.ruta, self.ruta_cerr)
 
     def guardar(self):
         """Se comprueba la tabla resultante ANTES de escribir: una orden no puede dejarla en un error que
         luego impida corregirla con la propia herramienta."""
         errores, _ = comprobar(self.filas, self.raiz, self.cfg, COLUMNAS, self.cerrados)
-        if errores:
+        nuevos = [e for e in errores if e not in self.errores]  # los que ya estaban no impiden arreglar otro
+        if nuevos:
             print("✗ No se escribe: la tabla quedaría con errores:")
-            for e in errores:
+            for e in nuevos:
                 print("  ✗ " + e)
             return 1
         escribir(self.ruta, self.filas, self.cfg)
+        if errores:
+            print("AVISO: la tabla sigue con errores («comprobar»):")
+            for e in errores:
+                print("  ✗ " + e)
         return 0
 
     def informe(self):
@@ -650,7 +850,7 @@ class Tabla:
 
 
 def o_nuevo(t, a):
-    f = orden_nuevo(t.filas, t.cerrados, a, t.hoy, t.cfg)
+    f = orden_nuevo(t.filas, t.cerrados + codigos_apartados(t.ruta, t.ruta_cerr), a, t.hoy, t.cfg)
     if t.guardar():
         return 1
     print(f"Creada {f['id']} → {f['para']}: {f['que']}")
@@ -666,7 +866,16 @@ def o_estado(t, a):
 
 
 def o_cambiar(t, a):
+    previa = buscar_fila(t.filas, a.id)
+    if tragadas(t.ruta.read_text(encoding="utf-8-sig"), len(COLUMNAS), t.cfg.re_id.match):
+        print("✗ No se escribe: hay filas metidas dentro de un campo (¿una comilla sin cerrar?). Escribir encima las "
+              "borraría. Ejecuta «reparar»: guarda una copia y las devuelve a su sitio.")
+        return 1
+    copia = dict(previa)
     f = orden_cambiar(t.filas, a, t.cfg)
+    if mete_salto(copia, f):
+        print("✗ No se escribe: un campo no admite saltos de línea.")
+        return 1
     if t.guardar():
         return 1
     print(f"{f['id']} cambiada")
@@ -684,12 +893,56 @@ def o_archivar(t, a):
     return 0
 
 
+def o_reparar(t, a):
+    bien = True
+    for r in (t.ruta, t.ruta_cerr):
+        if r.is_file():
+            ok_r, mensajes = reparar_archivo(r, COLUMNAS, t.cfg.re_id.match,
+                                             lambda filas, r=r: escribir(r, filas, t.cfg))
+            bien = bien and ok_r
+            print("\n".join(mensajes))
+    errores = Tabla(t.raiz, t.cfg, t.hoy).errores
+    for e in errores:
+        print("  ✗ " + e)
+    return 0 if bien and not errores else 1
+
+
+def o_apartadas(t, a):
+    print("\n".join(listar_apartadas(t.ruta, t.ruta_cerr)))
+    return 0
+
+
+def o_devolver(t, a):
+    def anadir(destino, fila):
+        tablas = {t.ruta: t.filas, t.ruta_cerr: t.cerrados}
+        if any(forma_rota(f) for filas in tablas.values() for f in filas):
+            return ["la tabla tiene filas rotas: ejecuta antes «reparar»"]
+        antes, _ = comprobar(t.filas, t.raiz, t.cfg, None, t.cerrados)
+        tablas[destino] = tablas[destino] + [fila]
+        despues, _ = comprobar(tablas[t.ruta], t.raiz, t.cfg, None, tablas[t.ruta_cerr])
+        nuevos = [e for e in despues if e not in antes]
+        if not nuevos:
+            escribir(destino, tablas[destino], t.cfg)
+        return nuevos
+    usados = {f.get("id") for f in t.filas + t.cerrados}
+    rc, mensajes = devolver((t.ruta, t.ruta_cerr), a.numero, a.fila, a.descartar, COLUMNAS, t.cfg.re_id.match,
+                            usados, anadir)
+    print("\n".join(mensajes))
+    return rc
+
+
 def o_resolver(t, a):
     if t.cabecera != COLUMNAS or any(forma_rota(f) for f in t.filas):
         print("✗ «resolver» solo arregla filas repetidas; la tabla tiene otro problema (cabecera o columnas "
-              "de más o de menos) que hay que corregir antes. Mira «comprobar».")
+              "de más o de menos) que hay que corregir antes. Ejecuta «reparar».")
         return 1
-    filas, msgs = resolver_fusion(t.filas, base_de_la_fusion(t.raiz, a.base, t.cfg.archivo), t.cerrados, t.cfg)
+    if any(tragadas(r.read_text(encoding="utf-8-sig"), len(COLUMNAS), t.cfg.re_id.match)
+           for r in (t.ruta, t.ruta_cerr) if r.is_file()):
+        print("✗ No se escribe: hay filas metidas dentro de un campo (¿una comilla sin cerrar?). Escribir encima las "
+              "borraría. Ejecuta «reparar»: guarda una copia y las devuelve a su sitio.")
+        return 1
+    filas, msgs = resolver_fusion(t.filas, base_de_la_fusion(t.raiz, a.base, t.cfg.archivo), t.cerrados, t.cfg,
+                                  codigos_apartados(t.ruta, t.ruta_cerr))
     escribir(t.ruta, filas, t.cfg)
     for m in msgs:
         print("  " + m)
@@ -738,7 +991,7 @@ def o_buscar(t, a):
 
 
 ORDENES = {"nuevo": o_nuevo, "estado": o_estado, "cambiar": o_cambiar, "archivar": o_archivar,
-           "resolver": o_resolver, "ver": o_ver, "hechos": o_hechos, "detalle": o_detalle,
+           "resolver": o_resolver, "reparar": o_reparar, "apartadas": o_apartadas, "devolver": o_devolver, "ver": o_ver, "hechos": o_hechos, "detalle": o_detalle,
            "buscar": o_buscar, "comprobar": lambda t, a: t.informe()}
 
 
@@ -774,6 +1027,12 @@ def crear_parser():
     p = sub.add_parser("detalle", parents=[comun]); p.add_argument("id")
     sub.add_parser("comprobar", parents=[comun])
     p = sub.add_parser("resolver", parents=[comun]); p.add_argument("--base")
+    sub.add_parser("reparar", parents=[comun])
+    sub.add_parser("apartadas", parents=[comun])
+    p_d = sub.add_parser("devolver", parents=[comun])
+    p_d.add_argument("numero", type=int)
+    p_d.add_argument("--fila")
+    p_d.add_argument("--descartar", action="store_true")
     p = sub.add_parser("archivar", parents=[comun]); p.add_argument("--dias", type=int, default=30)
     p = sub.add_parser("hechos", parents=[comun]); p.add_argument("quien", nargs="?")
     return ap
@@ -805,8 +1064,12 @@ def main(argv=None):
         if t.cabecera is None and a.orden != "nuevo":
             print(f"✗ No existe {cfg.archivo} en {raiz} (o está vacío). Crea el primero con «nuevo».")
             return 1
-        if a.orden in ESCRIBEN and t.errores:
-            print("✗ La tabla tiene errores; corrígelos antes de escribir:")
+        # «cambiar» es la salida cuando la tabla ya tiene errores (una nota de dos líneas que llega al juntar
+        # ramas): sin él solo queda editar el CSV a mano. Con columnas de más o de menos no escribe nadie,
+        # porque se perderían datos.
+        rota = t.cabecera != COLUMNAS or any(forma_rota(f) for f in t.filas)
+        if a.orden in ESCRIBEN and t.errores and (a.orden != "cambiar" or rota):
+            print("✗ La tabla tiene errores; corrígelos antes de escribir" + (" (ejecuta «reparar»):" if rota else " (con «cambiar»):"))
             for e in t.errores:
                 print("  ✗ " + e)
             return 1
@@ -1069,6 +1332,44 @@ def self_test():
             inicio = time.monotonic()
             rc, _ = con_salida("ver", "todas")
             ok(rc == 0 and time.monotonic() - inicio < 2, "una orden que solo lee no espera al candado")
+        # Una tabla que ya tiene errores se arregla con «cambiar», sin añadir otros
+        escribir(ruta, [], cfg)
+        for que in ("primera", "segunda"):
+            run("nuevo", "--de", "Trabajo", "--para", "Casa", "--que", que, dia="2026-11-18")
+        uno, dos = (f["id"] for f in filas_de())
+        sano = ruta.read_text(encoding="utf-8-sig")
+        rotas = [dict(f, nota="una" + chr(10) + "otra") for f in filas_de()]
+        escribir(ruta, rotas, cfg)
+        antes = ruta.read_bytes()
+        ok(run("nuevo", "--de", "Trabajo", "--para", "Casa", "--que", "x") == 1
+           and run("estado", uno, "en curso") == 1 and ruta.read_bytes() == antes,
+           "con errores, nuevo y estado no escriben")
+        ok(run("cambiar", uno, "--que", "a" + chr(10) + "b") == 1 and ruta.read_bytes() == antes,
+           "cambiar no añade un error nuevo")
+        rc, out = con_salida("cambiar", uno, "--nota", "bien")
+        ok(rc == 0 and "sigue con errores" in out and filas_de()[0]["nota"] == "bien",
+           "los errores que ya estaban no impiden arreglar otra fila")
+        ok(run("cambiar", dos, "--nota", "bien") == 0 and run("comprobar") == 0,
+           "cambiar arregla la tabla aunque tenga errores")
+        ruta.write_text(sano.replace(",primera,", ",primera,EXTRA,"), encoding="utf-8-sig")
+        antes = ruta.read_bytes()
+        ok(run("cambiar", dos, "--que", "z") == 1 and ruta.read_bytes() == antes,
+           "cambiar no escribe con columnas de más: se perderían")
+        ruta.write_text(sano, encoding="utf-8-sig")
+        # Filas tragadas por una comilla: ni «cambiar» ni «resolver» escriben encima
+        lineas = sano.splitlines()
+        lineas[1] += '"'
+        ruta.write_text(chr(10).join(lineas) + chr(10), encoding="utf-8-sig")
+        antes = ruta.read_bytes()
+        rc, out = con_salida("cambiar", uno, "--nota", "")
+        ok(rc == 1 and "metidas dentro" in out and ruta.read_bytes() == antes, "cambiar no borra filas tragadas")
+        rc, out = con_salida("resolver", "--base", "HEAD")
+        ok(rc == 1 and "metidas dentro" in out and ruta.read_bytes() == antes, "resolver no escribe con filas tragadas")
+        escribir(ruta, [dict(f, nota="una" + chr(10) + "otra") for f in csv.DictReader(io.StringIO(sano))], cfg)
+        antes = ruta.read_bytes()
+        ok(run("cambiar", uno, "--nota", "a" + chr(10) + "b") == 1 and ruta.read_bytes() == antes,
+           "un campo que ya tenía salto no admite otro")
+        ruta.write_text(sano, encoding="utf-8-sig")
         # --base que no es un commit (solo si hay Git)
         if shutil.which("git"):
             subprocess.run(["git", "init", "-q", str(raiz)], capture_output=True)
@@ -1120,6 +1421,119 @@ def self_test():
             main(["archivar", "--raiz", tmp, "--hoy", "2026-03-01"])
         ok(rc == 0 and not (Path(tmp) / ARCHIVO).exists() and len(leer(Path(tmp) / "tareas_cerrados.csv")[1]) == 1,
            "el nombre del archivo sale de config.json (y el de cerradas, de él)")
+    with tempfile.TemporaryDirectory() as tmp:
+        raiz = Path(tmp)
+        (raiz / "config.json").write_text(json.dumps(
+            {"areas": {"T": "Trabajo", "C": "Casa"}, "persona": "Alex"}), encoding="utf-8")
+        cfg = Config(raiz)
+        ruta = raiz / cfg.archivo
+
+        def rc_de(*args):
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    return main([*args, "--raiz", str(raiz), "--hoy", "2026-11-18"])
+                except SystemExit:
+                    return 1
+
+        for que in ("a, con coma", "b, también"):
+            rc_de("nuevo", "--de", "Trabajo", "--para", "Casa", "--que", que)
+        sano = ruta.read_text(encoding="utf-8-sig")
+        cambio = ("cambiar", "T1", "--nota", "")
+        # «reparar»: cada negativa tiene salida, sin Git, y no se pierde ninguna fila
+        def danar(texto):
+            ruta.write_text(texto, encoding="utf-8-sig")
+        def quedan():
+            return sorted(f["id"] for f in csv.DictReader(io.StringIO(ruta.read_text(encoding="utf-8-sig"))))
+        for viejas in ruta.parent.glob("*.copia"):
+            viejas.unlink()
+        ids = sorted(f["id"] for f in csv.DictReader(io.StringIO(sano)))
+        cab, uno_, dos_ = sano.splitlines()[:3]
+        for que, texto in (
+                ("comilla sin cerrar al final", [cab, uno_ + '"', dos_]),
+                ("comilla que se cierra en la fila siguiente", [cab, uno_ + '"', dos_ + '"'])):
+            danar(chr(10).join(texto) + chr(10))
+            antes = ruta.read_bytes()
+            ok(rc_de("comprobar") != 0 and rc_de(*cambio) != 0 and ruta.read_bytes() == antes, f"{que}: no se escribe encima")
+            ok(rc_de("reparar") == 0 and quedan() == ids and rc_de("comprobar") == 0, f"{que}: reparar devuelve las filas")
+            ok(any(p.read_bytes() == antes for p in ruta.parent.glob("*.copia")), f"{que}: queda copia de cómo estaba")
+        danar(chr(10).join([cab, uno_, "T9,Casa,abierta", dos_]) + chr(10))
+        ok(rc_de("comprobar") != 0 and rc_de(*cambio) != 0, "una fila cortada bloquea")
+        ok(rc_de("reparar") == 0 and quedan() == ids and rc_de("comprobar") == 0 and rc_de(*cambio) == 0,
+            "reparar la aparta y la tabla vuelve a funcionar")
+        aparte = ruta.with_name(ruta.name + ".apartadas.txt")
+        ok(aparte.is_file() and "T9,Casa,abierta" in aparte.read_text(encoding="utf-8"), "la fila apartada se conserva intacta")
+        # Una nota legítima de dos líneas que empieza como un código no se parte ni se aparta
+        filas_n = list(csv.DictReader(io.StringIO(sano)))
+        filas_n[0]["nota"] = "primera" + chr(10) + "T12, y luego seguimos"
+        salida_n = io.StringIO()
+        w = csv.DictWriter(salida_n, fieldnames=list(filas_n[0]), lineterminator=chr(10))
+        w.writeheader()
+        w.writerows(filas_n)
+        danar(salida_n.getvalue())
+        ok(rc_de("reparar") == 0 and quedan() == ids and rc_de("comprobar") == 0
+            and "primera T12, y luego seguimos" in ruta.read_text(encoding="utf-8-sig"),
+            "un texto de dos líneas queda en una, entero")
+        dos_filas = chr(10).join(["a,b,c", "T1,x," + chr(34), "T2,y," + chr(34)])
+        ok([f[0] for f in rehacer(dos_filas, 3, cfg.re_id.match)[0]] == ["T1", "T2"],
+           "al unir líneas no se traga la fila siguiente")
+        # Lo apartado: se avisa, su código queda reservado y vuelve con el mismo código
+        for viejas in ruta.parent.glob("*.apartadas.txt"):
+            viejas.unlink()
+        def salida(*args):
+            s = io.StringIO()
+            with contextlib.redirect_stdout(s):
+                main([*args, "--raiz", str(raiz), "--hoy", "2026-11-18"])
+            return s.getvalue()
+        danar(sano + "T3,Casa,abierta" + chr(10))
+        rc_de("reparar")
+        ok("apartadas sin revisar" in salida("comprobar") and "T3,Casa,abierta" in salida("apartadas"), "se avisa de lo apartado")
+        antes = ruta.read_bytes()
+        ok(rc_de("devolver", "1") != 0 and ruta.read_bytes() == antes, "una línea sin arreglar no vuelve")
+        ok(rc_de("devolver", "1", "--fila", 'T8,Casa,abierta,normal,medio,preguntar,2026-11-18,,,ocho,,') != 0 and ruta.read_bytes() == antes, "no vuelve con otro código")
+        antes = ruta.read_bytes()
+        ok(rc_de("devolver", "1", "--fila", 'T3,Casa,rara,normal,medio,preguntar,2026-11-18,,,"nueve, bis",,') != 0 and ruta.read_bytes() == antes,
+           "no vuelve algo que dejaría la tabla mal")
+        rc_de(*("nuevo", "--de", "Trabajo", "--para", "Casa", "--que", "x"))
+        ok("T3" not in quedan(), "el código apartado no lo reutiliza «nuevo»")
+        ok(rc_de("devolver", "1", "--fila", 'T3,Casa,abierta,normal,medio,preguntar,2026-11-18,,,"nueve, bis",,') == 0 and "T3" in quedan() and rc_de("comprobar") == 0,
+            "devolver la mete con su mismo código")
+        ok("apartadas sin revisar" not in salida("comprobar") and rc_de("devolver", "1") != 0, "ya no se avisa ni se repite")
+        danar(sano + "T1,Casa,abierta" + chr(10))
+        ruta.with_name(ruta.name + ".apartadas.txt").unlink()
+        rc_de("reparar")
+        antes = ruta.read_bytes()
+        ok(rc_de("devolver", "1", "--fila", 'T1,Casa,abierta,normal,medio,preguntar,2026-11-18,,,"nueve, bis",,') != 0
+           and ruta.read_bytes() == antes, "no vuelve con un código que ya está en la tabla")
+        ruta.with_name(ruta.name + ".apartadas.txt").unlink()
+        danar(sano + "<<<<<<< HEAD" + chr(10))
+        rc_de("reparar")
+        ok(rc_de("devolver", "1", "--descartar") == 0 and "apartadas sin revisar" not in salida("comprobar")
+            and "<<<<<<< HEAD" in ruta.with_name(ruta.name + ".apartadas.txt").read_text(encoding="utf-8"),
+            "descartar deja de avisar sin borrar nada")
+        # La primera línea dañada o ausente, y el archivo separado por «;»
+        cab, resto = sano.split(chr(10), 1)
+        for que, texto in (("dañada", cab.replace(",", "", 2) + chr(10) + resto), ("ausente", resto),
+                           ("separada por «;»", None)):
+            if texto is None:
+                s = io.StringIO()
+                csv.writer(s, delimiter=";", lineterminator=chr(10)).writerows(csv.reader(io.StringIO(sano)))
+                texto = s.getvalue()
+            danar(texto)
+            ok(rc_de("reparar") == 0 and rc_de("comprobar") == 0
+                and list(csv.reader(io.StringIO(ruta.read_text(encoding="utf-8-sig")))) == list(csv.reader(io.StringIO(sano))),
+                f"reparar repone la primera línea {que}")
+        columnas_ = cab.split(",")
+        columnas_[1], columnas_[2] = columnas_[2], columnas_[1]
+        danar(",".join(columnas_) + chr(10) + resto)
+        antes = ruta.read_bytes()
+        ok(rc_de("reparar") != 0 and ruta.read_bytes() == antes, "con las columnas en otro orden no adivina")
+        danar(sano)
+        res, _ = resolver_fusion([{"id": "T1", "que": "a"}, {"id": "T1", "que": "b"}], [], [], cfg, [{"id": "T2"}])
+        ok([f["id"] for f in res] == ["T1", "T3"], "resolver no reutiliza un código apartado")
+        danar("otra,cabecera" + chr(10))
+        antes = ruta.read_bytes()
+        ok(rc_de("reparar") != 0 and ruta.read_bytes() == antes, "con otra cabecera reparar no toca nada")
+        danar(sano)
     print(f"SELFTEST PASS: {casos}/{casos}")
     return 0
 

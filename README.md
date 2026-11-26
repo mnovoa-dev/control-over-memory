@@ -58,6 +58,7 @@ hecho, qué espera a quién ni qué vence. El modelo, además, «recuerda» esta
   plazo ni prioridad, hasta que deja de ser verdad.
 - `ver <área>` lo ordena por urgencia: vencido, plazo cercano, prioridad y, a igualdad, lo rápido primero.
 - Antes de escribir, comprueba la tabla entera, y escribe de forma que un corte a mitad no la deje rota.
+- Si la tabla ya trae un error (por ejemplo, tras juntar ramas), `cambiar` puede corregirlo sin editar el CSV a mano. Si una comilla sin cerrar ha metido filas dentro de un campo, o hay filas con columnas de más o de menos, no escribe encima: `reparar` guarda una copia, devuelve las filas a su sitio y aparta en un archivo al lado lo que no entiende. También repone la primera línea (los nombres de las columnas) y vuelve a comas un archivo separado por `;`. Mientras quede algo apartado, `comprobar` avisa; `apartadas` lo enseña y `devolver <n> --fila "…"` lo recupera con su mismo código (`--descartar` si no valía). No necesita Git.
 - Si dos ramas de Git tocan la tabla a la vez, `resolver` junta los cambios de cada una, campo a campo.
 
 **Cómo se prueba.** `py pendientes.py --self-test` (en una carpeta temporal; no toca tus datos).
@@ -96,8 +97,8 @@ py aprendizajes.py ver --desde 2026-11-01
   descuido, no a quien quiera saltárselos a propósito.
 - Una orden que escribe cada vez: si otra está escribiendo, la segunda espera unos segundos y, si no puede, se
   niega. Las que solo leen (`ver`, `comprobar`…) no esperan.
-  Para eso dejan un archivo `.lock` junto al CSV: si guardas tus CSV en Git, añade `*.lock` y `.*.tmp` a tu
-  `.gitignore`.
+  Para eso dejan un archivo `.lock` junto al CSV: si guardas tus CSV en Git, añade `*.lock`, `.*.tmp` y `.*.copia` a tu
+  `.gitignore`. El archivo `*.apartadas.txt`, en cambio, va a Git con su tabla: guarda filas que ya no están en ella.
 - Probadas en Windows, Linux y macOS con Python 3.10 y 3.13, en cada cambio (GitHub Actions): las autopruebas y
   20 órdenes que escriben y 20 que leen a la vez.
 - `resolver` de `pendientes.py` usa Git para encontrar la versión de antes de juntar dos ramas.
